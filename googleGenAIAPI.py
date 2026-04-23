@@ -4,12 +4,9 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-
-# Works locally (config.py) AND on Streamlit Cloud (st.secrets)
-try:
-    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
-except Exception:
-    from config import GOOGLE_API_KEY
+# On Streamlit Cloud: set via Manage App → Secrets
+# Locally: create .streamlit/secrets.toml with GOOGLE_API_KEY = "..."
+GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 
 
 class GoogleGenAIAPI:
