@@ -52,13 +52,21 @@ class Bot:
     # ------------------------------------------------------------------ #
  
     async def _get_response(self, messages: list) -> str:
-        completion = await self.llm.chat_completion(
-            model="gemini-3.1-flash-lite-preview",
-            messages=messages,
-            temperature=0,
-            max_tokens=1024,
-        )
-        return completion.choices[0].message["content"]
+    # Use vision-capable model if any message contains an image
+        has_image = any(
+            isinstance(msg.get("content"), list) and
+            any(block.get("type") == "image" for block in msg["content"])
+            for msg in messages
+    )
+    model = "gemini-2.5-flash" if has_image else "gemini-3.1-flash-lite-preview"
+
+    completion = await self.llm.chat_completion(
+        model=model,
+        messages=messages,
+        temperature=0,
+        max_tokens=1024,
+    )
+    return completion.choices[0].message["content"]
  
     async def _translate(self, content: str, lang: str) -> str:
         messages = [
