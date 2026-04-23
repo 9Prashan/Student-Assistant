@@ -1,4 +1,13 @@
+"""
+googleGenAIAPI.py
+-----------------
+Uses client.models.generate_content for ALL calls (text + image).
+This is the correct approach per the official google-genai SDK docs —
+chats.create() has limitations with multimodal content and history management.
+"""
+
 import asyncio
+import base64
 import re
 import streamlit as st
 from google import genai
@@ -13,13 +22,19 @@ class GoogleGenAIAPI:
         self.client = genai.Client(api_key=GOOGLE_API_KEY)
 
     async def chat_completion(self, model, messages, temperature, max_tokens):
-        # ------------------------------------------------------------------ #
-        # 1. Parse messages into components                                   #
-        # ------------------------------------------------------------------ #
+        """
+        Send a conversation to the Gemini API and return a response wrapper.
+        Uses generate_content for ALL calls — handles both text and images.
+
+        Accepts OpenAI-style messages:
+          [{"role": "system"|"user"|"assistant", "content": str | list}, ...]
+
+        Returns object with: response.choices[0].message["content"]
+        """
+
+        # ── 1. Build system instruction and contents list ──────────────────
         system_instruction = None
-        history = []
-        last_user_content = None   # raw content (str or list)
-        has_image = False
+        contents = []   # list of types.Content
 
         for msg in messages:
             role    = msg["role"]
@@ -27,131 +42,99 @@ class GoogleGenAIAPI:
 
             if role == "system":
                 system_instruction = content
+                continue
 
-            elif role == "user":
-                last_user_content = content
-                # Check if this message contains an image
-                if isinstance(content, list):
-                    for block in content:
-                        if block.get("type") == "image":
-                            has_image = True
-                parts = self._build_parts(content)
-                history.append(types.Content(role="user", parts=parts))
+            # Map OpenAI roles to Gemini roles
+            gemini_role = "model" if role == "assistant" else "user"
+            parts = self._build_parts(content)
+            contents.append(types.Content(role=gemini_role, parts=parts))
 
-            elif role == "assistant":
-                text = content if isinstance(content, str) else str(content)
-                history.append(types.Content(role="model", parts=[types.Part(text=text)]))
-
-        # Remove last user turn from history — sent separately
-        if history and history[-1].role == "user":
-            history.pop()
-
-        # ------------------------------------------------------------------ #
-        # 2. Build config                                                     #
-        # ------------------------------------------------------------------ #
+        # ── 2. Build generation config ──────────────────────────────────────
         config = types.GenerateContentConfig(
             temperature=temperature,
             max_output_tokens=max_tokens,
             system_instruction=system_instruction,
         )
 
-        # ------------------------------------------------------------------ #
-        # 3. Call API — images use generate_content, text uses chat session  #
-        # ------------------------------------------------------------------ #
-        last_parts = self._build_parts(last_user_content)
-
+        # ── 3. Call API with retry + back-off ───────────────────────────────
         for attempt in range(self.retries):
             try:
                 loop = asyncio.get_event_loop()
 
-                if has_image:
-                    # Images MUST use generate_content directly, not chat
-                    def _call_image():
-                        # Build full contents: history + last user message
-                        all_contents = history + [
-                            types.Content(role="user", parts=last_parts)
-                        ]
-                        return self.client.models.generate_content(
-                            model=model,
-                            contents=all_contents,
-                            config=config,
-                        )
-                    response = await loop.run_in_executor(None, _call_image)
-                    return _GeminiResponseWrapper(response.text)
+                # Capture in local vars for the closure
+                _contents = contents
+                _config   = config
+                _model    = model
 
-                else:
-                    # Text-only — use chat session
-                    def _call_text():
-                        chat = self.client.chats.create(
-                            model=model, history=history, config=config
-                        )
-                        if len(last_parts) == 1 and last_parts[0].text is not None:
-                            return chat.send_message(last_parts[0].text)
-                        return chat.send_message(last_parts)
+                def _call():
+                    return self.client.models.generate_content(
+                        model=_model,
+                        contents=_contents,
+                        config=_config,
+                    )
 
-                    response = await loop.run_in_executor(None, _call_text)
-                    return _GeminiResponseWrapper(response.text)
+                response = await loop.run_in_executor(None, _call)
+                return _GeminiResponseWrapper(response.text)
 
             except Exception as e:
-                error_str = str(e)
-                wait_seconds = self._parse_retry_delay(error_str)
+                error_str   = str(e)
+                wait        = self._parse_retry_delay(error_str)
 
-                if wait_seconds:
-                    print(f"\n⏳ Rate limit — waiting {wait_seconds}s (attempt {attempt + 1}/{self.retries})...")
-                    await asyncio.sleep(wait_seconds)
+                if wait:
+                    print(f"⏳ Rate limit — waiting {wait}s "
+                          f"(attempt {attempt + 1}/{self.retries})...")
+                    await asyncio.sleep(wait)
                 elif attempt < self.retries - 1:
-                    fallback = 2 ** attempt
-                    print(f"Error (attempt {attempt + 1}): {e} — retrying in {fallback}s...")
-                    await asyncio.sleep(fallback)
+                    backoff = 2 ** attempt
+                    print(f"Error (attempt {attempt + 1}): {e} "
+                          f"— retrying in {backoff}s...")
+                    await asyncio.sleep(backoff)
                 else:
-                    print(f"Error (attempt {attempt + 1}): {e}")
                     raise e
 
         raise RuntimeError("Max retries exceeded.")
 
-    # ------------------------------------------------------------------ #
-    # Helpers                                                              #
-    # ------------------------------------------------------------------ #
+    # ── Helpers ────────────────────────────────────────────────────────────
 
     def _build_parts(self, content) -> list:
-        """Convert OpenAI-style content into Gemini Part objects."""
+        """
+        Convert OpenAI-style content into a list of Gemini Part objects.
+
+        str   → [Part(text=...)]
+        list  → each block converted:
+                  {"type":"text",  "text":"..."}
+                  {"type":"image", "source":{"type":"base64","media_type":"...","data":"..."}}
+        """
         if isinstance(content, str):
-            return [types.Part(text=content)]
+            return [types.Part.from_text(text=content)]
 
         if isinstance(content, list):
             parts = []
             for block in content:
-                if block.get("type") == "text":
-                    parts.append(types.Part(text=block["text"]))
-                elif block.get("type") == "image":
-                    source = block["source"]
-                    if source["type"] == "base64":
-                        import base64
-                        # Decode base64 string to bytes
-                        image_bytes = base64.b64decode(source["data"])
+                btype = block.get("type")
+                if btype == "text":
+                    parts.append(types.Part.from_text(text=block["text"]))
+                elif btype == "image":
+                    src = block["source"]
+                    if src["type"] == "base64":
+                        image_bytes = base64.b64decode(src["data"])
                         parts.append(
-                            types.Part(
-                                inline_data=types.Blob(
-                                    mime_type=source["media_type"],
-                                    data=image_bytes,
-                                )
+                            types.Part.from_bytes(
+                                data=image_bytes,
+                                mime_type=src["media_type"],
                             )
                         )
             return parts
 
-        return [types.Part(text=str(content))]
+        return [types.Part.from_text(text=str(content))]
 
     @staticmethod
     def _parse_retry_delay(error_str: str):
-        match = re.search(r'retry[^\d]*(\d+(?:\.\d+)?)s', error_str, re.IGNORECASE)
-        if match:
-            return float(match.group(1)) + 2
-        return None
+        m = re.search(r'retry[^\d]*(\d+(?:\.\d+)?)s', error_str, re.IGNORECASE)
+        return float(m.group(1)) + 2 if m else None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Response wrapper — completion.choices[0].message["content"]
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Response wrapper ────────────────────────────────────────────────────────
 class _GeminiResponseWrapper:
     def __init__(self, text: str):
         self.choices = [_Choice(text)]

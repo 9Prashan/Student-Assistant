@@ -1,7 +1,8 @@
 """
 EduBot.py
 ---------
-Synchronous Bot class designed for use with Streamlit.
+Synchronous Bot class for Streamlit.
+Uses asyncio.run() internally so Streamlit can call sync methods.
 """
 
 import asyncio
@@ -17,9 +18,7 @@ class Bot:
     def __init__(self):
         self.llm = GoogleGenAIAPI()
 
-    # ------------------------------------------------------------------ #
-    # Public sync API (called by Streamlit)                               #
-    # ------------------------------------------------------------------ #
+    # ── Public sync API ────────────────────────────────────────────────────
 
     def format_content_sync(self, content: str) -> str:
         return asyncio.run(self._format_content(content))
@@ -30,31 +29,18 @@ class Bot:
     def get_bot_response_sync(self, messages: list) -> str:
         return asyncio.run(self._get_response(messages))
 
-    # ------------------------------------------------------------------ #
-    # Message builder helpers                                             #
-    # ------------------------------------------------------------------ #
-
     def build_initial_messages(self, problem: str, solution: str) -> list:
         return [
             {"role": "system", "content": bot_sys_prompt},
             {"role": "user",   "content": bot_prompt(problem=problem, solution=solution)},
         ]
 
-    # ------------------------------------------------------------------ #
-    # Internal async implementations                                      #
-    # ------------------------------------------------------------------ #
+    # ── Internal async implementations ────────────────────────────────────
 
     async def _get_response(self, messages: list) -> str:
-        # Use vision-capable model if any message contains an image
-        has_image = any(
-            isinstance(msg.get("content"), list) and
-            any(block.get("type") == "image" for block in msg["content"])
-            for msg in messages
-        )
-        model = "gemini-2.5-flash" if has_image else "gemini-3.1-flash-lite-preview"
-
+        # gemini-3-flash-preview handles both text and images natively
         completion = await self.llm.chat_completion(
-            model=model,
+            model="gemini-3-flash-preview",
             messages=messages,
             temperature=0,
             max_tokens=1024,
@@ -67,7 +53,7 @@ class Bot:
             {"role": "user",   "content": translator_prompt(content=content, lang=lang)},
         ]
         res = await self.llm.chat_completion(
-            model="gemini-3.1-flash-lite-preview",
+            model="gemini-2.5-flash-lite",
             messages=messages,
             temperature=0,
             max_tokens=512,
@@ -80,7 +66,7 @@ class Bot:
             {"role": "user",   "content": format_content_prompt(content=content)},
         ]
         res = await self.llm.chat_completion(
-            model="gemini-3.1-flash-lite-preview",
+            model="gemini-2.5-flash-lite",
             messages=messages,
             temperature=0,
             max_tokens=512,
